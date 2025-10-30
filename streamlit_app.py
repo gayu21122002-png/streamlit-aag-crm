@@ -1,132 +1,228 @@
 import streamlit as st
+import pandas as pd
+import json
+import os
 from google import genai
-from google.genai.errors import APIError
+from google.genai import types
 
-# --- DASHBOARD SETUP ---
-st.set_page_config(
-    page_title="AI Authenticity Guardian (AAG)",
-    page_icon="🛡️",
-    layout="wide"
-)
+# --- Configuration ---
+GEMINI_MODEL = "gemini-2.5-flash"
+EMAIL_RECIPIENT = "crm_team@yourcompany.com" # Replace with a test email address
 
-st.title("🛡️ AI Authenticity Guardian (AAG) Dashboard")
-st.subheader("Product Listing Analysis for Analytical CRM")
+# --- Streamlit Secrets for Email (You MUST set these in Streamlit Cloud secrets) ---
+# We will use st.secrets to securely store email credentials later.
+# For now, we'll set placeholders to prevent errors.
+SMTP_SERVER = st.secrets.get("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = st.secrets.get("SMTP_PORT", 587)
+SENDER_EMAIL = st.secrets.get("SENDER_EMAIL", "your_sender_email@gmail.com")
+SENDER_PASSWORD = st.secrets.get("SENDER_PASSWORD", "your_app_password")
 
-# --- GEMINI CLIENT INITIALIZATION ---
-# The API Key is loaded automatically from the Streamlit Secrets
+# --- DATA LOADING FUNCTION ---
+@st.cache_data
+def load_sample_data():
+    """Loads the sample product data from CSV."""
+    if os.path.exists("sample_products.csv"):
+        # We explicitly define the data types to prevent Streamlit errors
+        df = pd.read_csv("sample_products.csv", dtype={'Product_ID': str, 'Brand': str, 'Description': str, 'Price': int})
+        return df
+    else:
+        st.error("🚨 **Error:** `sample_products.csv` not found. Please create the file and upload it to your repository.")
+        return pd.DataFrame()
+
+# --- GEMINI API SETUP ---
 try:
     # Initialize the client using the API key stored in Streamlit secrets
-    # The key is accessed via st.secrets["GEMINI_API_KEY"]
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-    model = "gemini-2.5-flash"
-except (KeyError, ValueError) as e:
-    # Handle case where the secret key is missing or invalid
-    st.error(f"Configuration Error: GEMINI_API_KEY not found in Streamlit Secrets. Please ensure you have set the secret.")
+except KeyError:
+    st.error("🚨 **Gemini API Key Missing:** Please add `GEMINI_API_KEY` to your Streamlit secrets.")
+    client = None
+except Exception as e:
+    st.error(f"🚨 **Gemini Client Error:** {e}")
+    client = None
+
+# --- STREAMLIT APP LAYOUT ---
+
+st.set_page_config(page_title="AAG: Similarity Guardian", layout="wide")
+st.title("🛡️ AI Authenticity & Similarity Guardian (AAG)")
+st.caption("Now checking new listings against your sample data using Gemini.")
+
+# Load the data and display for reference
+sample_data = load_sample_data()
+if not sample_data.empty:
+    st.subheader("Reference Data (Sample Products)")
+    st.dataframe(sample_data, use_container_width=True, hide_index=True)
+    st.markdown("---")
+else:
     st.stop()
-except APIError as e:
-    st.error(f"API Connection Error: Could not initialize Gemini Client. Details: {e}")
-    st.stop()
 
 
-# --- ANALYSIS LOGIC (CACHED) ---
-@st.cache_data(show_spinner=False)
-def analyze_listing(listing_text):
-    """Analyzes a product listing using the Gemini API."""
-
-    # --- Prompt Engineering ---
-    prompt = f"""
-    You are an AI Authenticity Guardian (AAG) for a premium e-commerce platform. Your role is to analyze product listings for authenticity and quality signals.
-
-    Analyze the following product listing:
-    ---
-    {listing_text}
-    ---
-
-    Provide your analysis in the following structured JSON format:
-    {{
-      "authenticity_score": "X/10",
-      "risk_level": "Low Risk" | "Medium Risk" | "High Risk",
-      "reasons": [
-        "Reason 1: Detail about why this affects the score.",
-        "Reason 2: Detail about why this affects the score."
-      ],
-      "crm_action_recommendation": "A concise, single-sentence instruction for the CRM analyst."
-    }}
-
-    Rules:
-    1. The authenticity_score must be X/10.
-    2. The risk_level must be one of the three options provided.
-    3. The output MUST be only the raw JSON object, nothing else.
-    """
-
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config={"response_mime_type": "application/json"}
-        )
-
-        # The response text will be a JSON string, which we load
-        import json
-        return json.loads(response.text)
-
-    except Exception as e:
-        st.error(f"Gemini API Call Failed: {e}")
-        return None
-
-
-# --- USER INTERFACE & FLOW ---
-
-product_listing = st.text_area(
-    "Paste the New Product Listing Text Here:",
-    height=250,
-    placeholder="Example: 'A brand new, genuine leather handbag, hand-stitched in Italy. Serial number AB12345. Comes with a certificate of authenticity.'"
+# --- INPUT FORM ---
+st.subheader("Analyze a New Product Listing")
+new_listing_name = st.text_input(
+    "1. Enter New Product Name/Description:",
+    value="VILVAH Milk Drops Brightening Serum (20ml) - ₹620",
+    help="Enter the full listing title and size."
+)
+new_listing_price = st.number_input(
+    "2. Enter New Product Price (₹):",
+    min_value=1,
+    value=620,
+    help="Enter the selling price."
 )
 
-if st.button("Analyze Listing Authenticity"):
-    if not product_listing:
-        st.warning("Please paste a product listing to begin analysis.")
-        st.stop()
 
-    # Run analysis and display results
-    with st.spinner("Running deep analysis with Gemini (this may take a few seconds)..."):
-        analysis_result = analyze_listing(product_listing)
+# --- GEMINI FUNCTION (SIMILARITY CHECK) ---
 
-    if analysis_result:
-        st.success("✅ Analysis Complete!")
+def run_similarity_analysis(data_df, new_name, new_price):
+    """
+    Constructs the prompt and calls the Gemini API to perform similarity analysis.
+    """
+    if not client:
+        return None, "Gemini client not initialized."
 
-        # Determine color for the risk level
-        if analysis_result.get("risk_level") == "High Risk":
-            color = "inverse"
-            icon = "🚨"
-        elif analysis_result.get("risk_level") == "Medium Risk":
-            color = "off"
-            icon = "⚠️"
-        else:
-            color = "normal"
-            icon = "✅"
+    # 1. Prepare the Sample Data as a readable string for the model
+    data_str = data_df.to_string(index=False)
+    
+    # 2. Define the Structured Output Schema
+    # This forces the model to return data in a predictable, parseable JSON format.
+    analysis_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "Similarity_Score_Percent": types.Type.INTEGER,
+            "Risk_Level": types.Type.STRING,
+            "Matching_Product_ID": types.Type.STRING,
+            "Matching_Product_Description": types.Type.STRING,
+            "Reasoning": types.Type.STRING,
+            "Action_Recommendation": types.Type.STRING
+        },
+        required=["Similarity_Score_Percent", "Risk_Level", "Reasoning"]
+    )
 
-        # Display Metrics
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric(
-                label="Authenticity Score", 
-                value=analysis_result.get("authenticity_score", "N/A")
+    # 3. Construct the System Instruction and Prompt
+    system_instruction = (
+        "You are an AI Product Duplication and Similarity Guardian. "
+        "Your task is to compare a NEW listing against a list of EXISTING products. "
+        "The comparison must primarily focus on the product name/description and price, "
+        "and determine a similarity score (0-100%). A score over 75% is considered 'HIGH RISK' for duplication."
+    )
+    
+    prompt = f"""
+    --- EXISTING PRODUCT DATABASE ---
+    {data_str}
+    
+    --- NEW PRODUCT LISTING ---
+    Name/Description: {new_name}
+    Price: {new_price}
+    
+    --- ANALYSIS INSTRUCTIONS ---
+    1. Analyze the 'NEW PRODUCT LISTING' against all products in the 'EXISTING PRODUCT DATABASE'.
+    2. Determine the single highest 'Similarity_Score_Percent' to any existing product. 
+    3. Identify the 'Matching_Product_ID' and 'Matching_Product_Description' for the product with the highest score.
+    4. Based on the Similarity Score:
+       - 0-25%: Low Risk (New Product)
+       - 26-75%: Medium Risk (Similar Product, review needed)
+       - 76-100%: High Risk (Likely Duplicate, reject and send email)
+    5. Provide a clear, concise 'Reasoning' and an 'Action_Recommendation'.
+    6. Return the output ONLY as a single JSON object that strictly conforms to the provided schema.
+    """
+    
+    # 4. Call the Gemini API with the structured response configuration
+    with st.spinner("Running deep similarity analysis with Gemini..."):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    response_schema=analysis_schema
+                )
             )
-        with col2:
-            st.metric(
-                label="Risk Level", 
-                value=f"{icon} {analysis_result.get('risk_level', 'N/A')}", 
-                delta=analysis_result.get("risk_level", "N/A"),
-                delta_color=color
-            )
+            # The response.text is a JSON string conforming to the schema
+            analysis_result = json.loads(response.text)
+            return analysis_result, None
+            
+        except Exception as e:
+            return None, f"Gemini API Call Failed: {e}"
 
-        st.divider()
 
-        # Display Reasoning
-        st.subheader("🕵️ LLM Reasoning for Score")
-        st.markdown(f"**Recommendation for CRM Analyst:** *{analysis_result.get('crm_action_recommendation', 'No recommendation.')}*")
-        st.markdown("---")
+# --- EMAIL FUNCTION (TO BE IMPLEMENTED) ---
 
-        st.write("**Key Reasons:**")
-        st.warning("\n".join([f"* {reason}" for reason in analysis_result.get("reasons", ["No specific reasons provided."])]))
+def send_email_report(analysis_data):
+    """Placeholder for the function to send the email."""
+    
+    if SENDER_EMAIL == "your_sender_email@gmail.com":
+        st.warning("⚠️ **Email Setup Pending:** Skipping email. You need to configure `SENDER_EMAIL`, `SENDER_PASSWORD`, `SMTP_SERVER`, and `SMTP_PORT` in Streamlit secrets.")
+        return False
+        
+    try:
+        # NOTE: The actual email implementation will use the `smtplib` library.
+        # This is a placeholder to show the required format.
+        
+        # Build the neat email body format
+        report_body = f"""
+        **AAG Similarity Report**
+        
+        * New Listing: {new_listing_name} (₹{new_listing_price})
+        
+        ---
+        
+        ## 🚨 Duplication Alert: {analysis_data['Risk_Level'].upper()} 🚨
+        
+        * **Similarity Score:** {analysis_data['Similarity_Score_Percent']}%
+        * **Matching Product ID:** {analysis_data.get('Matching_Product_ID', 'N/A')}
+        * **Reasoning:** {analysis_data['Reasoning']}
+        * **Recommended Action:** {analysis_data['Action_Recommendation']}
+        """
+
+        # For now, just display the email body instead of sending
+        st.success(f"✅ **Report Prepared for {EMAIL_RECIPIENT}:**")
+        st.code(report_body)
+        return True
+
+    except Exception as e:
+        st.error(f"❌ **Email Sending Failed:** {e}")
+        return False
+
+
+# --- BUTTON AND EXECUTION ---
+
+if st.button("🔍 Run Similarity Check & Generate Report", type="primary"):
+    if client:
+        # 1. Run the analysis
+        analysis_data, error = run_similarity_analysis(sample_data, new_listing_name, new_listing_price)
+        
+        # 2. Display results or error
+        if analysis_data:
+            st.markdown("---")
+            st.subheader("✅ AI Similarity Guardian Report")
+            
+            # Determine background color based on risk level
+            risk = analysis_data['Risk_Level'].lower()
+            if risk == "high risk":
+                st.error(f"### 🚨 {analysis_data['Risk_Level'].upper()} - Likely Duplicate Detected")
+            elif risk == "medium risk":
+                st.warning(f"### 🟠 {analysis_data['Risk_Level'].upper()} - Review Recommended")
+            else:
+                st.success(f"### 🟢 {analysis_data['Risk_Level'].upper()} - New Product")
+            
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Similarity Score", f"{analysis_data['Similarity_Score_Percent']}%")
+                st.metric("Matching Product ID", analysis_data.get('Matching_Product_ID', 'N/A'))
+            with col2:
+                st.metric("Matching Description", analysis_data.get('Matching_Product_Description', 'N/A'))
+                st.metric("Recommended Action", analysis_data['Action_Recommendation'])
+
+            st.markdown(f"**Detailed Reasoning:** {analysis_data['Reasoning']}")
+            
+            # 3. Check for the 75% threshold and send email
+            if analysis_data['Similarity_Score_Percent'] >= 75:
+                st.info("🎯 **Threshold Met:** Similarity score is 75% or higher. Preparing to send email alert.")
+                send_email_report(analysis_data)
+                
+        elif error:
+            st.error(f"Analysis failed: {error}")
+    else:
+        st.warning("Please resolve the Gemini API key issue before running analysis.")
