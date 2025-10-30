@@ -10,8 +10,7 @@ GEMINI_MODEL = "gemini-2.5-flash"
 EMAIL_RECIPIENT = "crm_team@yourcompany.com" # Replace with a test email address
 
 # --- Streamlit Secrets for Email (You MUST set these in Streamlit Cloud secrets) ---
-# We will use st.secrets to securely store email credentials later.
-# For now, we'll set placeholders to prevent errors.
+# We use st.secrets.get() to provide safe default values if the secrets are missing.
 SMTP_SERVER = st.secrets.get("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = st.secrets.get("SMTP_PORT", 587)
 SENDER_EMAIL = st.secrets.get("SENDER_EMAIL", "your_sender_email@gmail.com")
@@ -22,7 +21,7 @@ SENDER_PASSWORD = st.secrets.get("SENDER_PASSWORD", "your_app_password")
 def load_sample_data():
     """Loads the sample product data from CSV."""
     if os.path.exists("sample_products.csv"):
-        # We explicitly define the data types to prevent Streamlit errors
+        # Explicitly defining data types for robustness
         df = pd.read_csv("sample_products.csv", dtype={'Product_ID': str, 'Brand': str, 'Description': str, 'Price': int})
         return df
     else:
@@ -84,13 +83,11 @@ def run_similarity_analysis(data_df, new_name, new_price):
     data_str = data_df.to_string(index=False)
     
     # 2. Define the Structured Output Schema
-    # This forces the model to return data in a predictable, parseable JSON format.
+    # NOTE: Similarity_Score_Percent is set to STRING to prevent the pydantic validation error.
     analysis_schema = types.Schema(
         type=types.Type.OBJECT,
         properties={
-            # CHANGE THIS LINE: from types.Type.INTEGER to types.Type.STRING
             "Similarity_Score_Percent": types.Type.STRING, 
-            
             "Risk_Level": types.Type.STRING,
             "Matching_Product_ID": types.Type.STRING,
             "Matching_Product_Description": types.Type.STRING,
@@ -105,7 +102,8 @@ def run_similarity_analysis(data_df, new_name, new_price):
         "You are an AI Product Duplication and Similarity Guardian. "
         "Your task is to compare a NEW listing against a list of EXISTING products. "
         "The comparison must primarily focus on the product name/description and price, "
-        "and determine a similarity score (0-100%). A score over 75% is considered 'HIGH RISK' for duplication."
+        "and determine a similarity score (0-100%). A score over 75% is considered 'HIGH RISK' for duplication. "
+        "The Similarity_Score_Percent MUST be returned as a string, e.g., '95' or '20'."
     )
     
     prompt = f"""
@@ -154,7 +152,7 @@ def send_email_report(analysis_data):
     """Placeholder for the function to send the email."""
     
     if SENDER_EMAIL == "your_sender_email@gmail.com":
-        st.warning("⚠️ **Email Setup Pending:** Skipping email. You need to configure `SENDER_EMAIL`, `SENDER_PASSWORD`, `SMTP_SERVER`, and `SMTP_PORT` in Streamlit secrets.")
+        st.warning("⚠️ **Email Setup Pending:** Skipping email. You need to configure email secrets in Streamlit Cloud (`SENDER_EMAIL`, `SENDER_PASSWORD`, etc.) to enable sending.")
         return False
         
     try:
@@ -178,7 +176,7 @@ def send_email_report(analysis_data):
         """
 
         # For now, just display the email body instead of sending
-        st.success(f"✅ **Report Prepared for {EMAIL_RECIPIENT}:**")
+        st.success(f"✅ **Report Prepared for {EMAIL_RECIPIENT}:** (Simulated Send)")
         st.code(report_body)
         return True
 
@@ -194,23 +192,44 @@ if st.button("🔍 Run Similarity Check & Generate Report", type="primary"):
         # 1. Run the analysis
         analysis_data, error = run_similarity_analysis(sample_data, new_listing_name, new_listing_price)
         
-      # 2. Display results or error
-            if analysis_data:
-                # ... (omitting lines for brevity) ...
+        # 2. Display results or error
+        if analysis_data:
+            st.markdown("---")
+            st.subheader("✅ AI Similarity Guardian Report")
+            
+            # Determine background color based on risk level
+            risk = analysis_data['Risk_Level'].lower()
+            if risk == "high risk":
+                st.error(f"### 🚨 {analysis_data['Risk_Level'].upper()} - Likely Duplicate Detected")
+            elif risk == "medium risk":
+                st.warning(f"### 🟠 {analysis_data['Risk_Level'].upper()} - Review Recommended")
+            else:
+                st.success(f"### 🟢 {analysis_data['Risk_Level'].upper()} - New Product")
+            
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Similarity Score", f"{analysis_data['Similarity_Score_Percent']}%")
+                st.metric("Matching Product ID", analysis_data.get('Matching_Product_ID', 'N/A'))
+            with col2:
+                st.metric("Matching Description", analysis_data.get('Matching_Product_Description', 'N/A'))
+                st.metric("Recommended Action", analysis_data['Action_Recommendation'])
 
-                st.markdown(f"**Detailed Reasoning:** {analysis_data['Reasoning']}")
+            st.markdown(f"**Detailed Reasoning:** {analysis_data['Reasoning']}")
+            
+            # --- Score Conversion and Email Logic ---
+            try:
+                # Convert the score (which is a string like '95') to an integer for comparison
+                score = int(analysis_data['Similarity_Score_Percent'].strip())
+            except ValueError:
+                st.error("Error: AI returned a score that is not a valid number. Defaulting to 0% score.")
+                score = 0
+            
+            # 3. Check for the 75% threshold and send email
+            if score >= 75:
+                st.info("🎯 **Threshold Met (>= 75%):** High similarity detected. Preparing to send email alert.")
+                send_email_report(analysis_data)
                 
-                # --- FIX: Convert the string score to an integer for comparison ---
-                try:
-                    score = int(analysis_data['Similarity_Score_Percent'].replace('%', '').strip())
-                except ValueError:
-                    st.error("Error parsing the score from AI output. Using default score of 0.")
-                    score = 0
-                
-       # 3. Check for the 75% threshold and send email
-                if score >= 75:
-                    st.info("🎯 **Threshold Met:** Similarity score is 75% or higher. Preparing to send email alert.")
-                    send_email_report(analysis_data)
         elif error:
             st.error(f"Analysis failed: {error}")
     else:
