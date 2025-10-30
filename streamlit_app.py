@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import json
 import os
-import re # Import the regular expression module
+import re 
 from google import genai
 from google.genai import types
 
@@ -16,27 +16,21 @@ SMTP_PORT = st.secrets.get("SMTP_PORT", 587)
 SENDER_EMAIL = st.secrets.get("SENDER_EMAIL", "your_sender_email@gmail.com")
 SENDER_PASSWORD = st.secrets.get("SENDER_PASSWORD", "your_app_password")
 
-# --- DATA CLEANING FUNCTION (NEW) ---
+# --- DATA CLEANING FUNCTION (RETAINS REGEX) ---
 def clean_json_response(response_text: str) -> str:
     """
     Cleans the raw text response from the Gemini API to extract a pure JSON string.
-    This fixes issues where the model wraps the JSON in markdown (```json ... ```) 
-    or adds extraneous text before or after the JSON object.
     """
     # Pattern to find a JSON block wrapped in ```json ... ``` or just ``` ... ```
     match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
     if match:
-        # Return the content inside the markdown block
         return match.group(1).strip()
     
-    # Fallback: if no markdown wrapper is found, try to find a pure JSON object
-    # This is a very simple pattern to match content between the first { and last }
-    # It might fail for complex or nested JSON but is a reasonable last resort.
+    # Fallback: Find content between the first { and last }
     match = re.search(r'\{[\s\S]*\}', response_text.strip())
     if match:
         return match.group(0).strip()
     
-    # If all else fails, return the original text, which will likely fail parsing
     return response_text.strip()
 
 
@@ -96,36 +90,33 @@ new_listing_price = st.number_input(
 )
 
 
-# --- GEMINI FUNCTION (SIMILARITY CHECK) ---
+# --- GEMINI FUNCTION (SIMILARITY CHECK) - NO RESPONSE_SCHEMA ---
 
 def run_similarity_analysis(data_df, new_name, new_price):
     """
     Constructs the prompt and calls the Gemini API to perform similarity analysis.
+    This version relies ONLY on the prompt for JSON output, removing the strict schema.
     """
     if not client:
         return None, "Gemini client not initialized."
 
-    # 1. Prepare the Sample Data as a readable string for the model
     data_str = data_df.to_string(index=False)
     
-    # 2. Define the Structured Output Schema - SIMPLIFIED AND STRING-ONLY
-    analysis_schema = types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "Similarity_Score_Percent": types.Type.STRING, 
-            "Risk_Level": types.Type.STRING,
-            "Matching_Product_ID": types.Type.STRING,
-            "Reasoning": types.Type.STRING,
-        },
-        required=["Similarity_Score_Percent", "Risk_Level", "Reasoning"]
-    )
+    # 1. Define the desired JSON structure for the model
+    json_format_example = {
+        "Similarity_Score_Percent": "95",
+        "Risk_Level": "HIGH RISK",
+        "Matching_Product_ID": "P001",
+        "Reasoning": "The new listing exactly matches the existing 'P001' item name and price."
+    }
 
-    # 3. Construct the System Instruction and Prompt - MORE STRICT
+    # 2. Construct the System Instruction and Prompt - EXTREMELY STRICT
     system_instruction = (
         "You are an AI Product Duplication and Similarity Guardian. "
         "Your task is to compare a NEW listing against a list of EXISTING products. "
         "The comparison must determine a similarity score (0-100%). "
-        "A score over 75% is 'HIGH RISK'. The output MUST be a JSON object ONLY."
+        "A score over 75% is 'HIGH RISK'. Your entire output MUST be a valid JSON object ONLY, "
+        "without any introductory text, markdown wrappers (like ```json), or final remarks."
     )
     
     prompt = f"""
@@ -144,33 +135,42 @@ def run_similarity_analysis(data_df, new_name, new_price):
        - 0-25%: Low Risk
        - 26-75%: Medium Risk
        - 76-100%: High Risk
-    5. Provide a clear, concise 'Reasoning' based on the name and price similarity.
-    6. Return the output ONLY as a single JSON object that strictly conforms to the provided schema. DO NOT include any markdown formatting like ```json.
+    5. Provide a clear, concise 'Reasoning' (1-2 sentences).
+    6. Return the output in the EXACT JSON format shown below, and NO other text:
+       {json.dumps(json_format_example, indent=2)}
     """
     
-    # 4. Call the Gemini API 
+    # 3. Call the Gemini API without response_schema
     with st.spinner("Running deep similarity analysis with Gemini..."):
         try:
+            # Removed response_schema and response_mime_type to use standard text generation
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    response_mime_type="application/json",
-                    response_schema=analysis_schema
                 )
             )
             
-            # --- CRITICAL FIX: Clean the response text before loading JSON ---
+            # CRITICAL FIX: Clean and Load the JSON string
             cleaned_json_str = clean_json_response(response.text)
             
-            # Try to load the cleaned JSON string
+            # This line will now handle the JSON parsing without Pydantic validation
             analysis_result = json.loads(cleaned_json_str)
+            
+            # Perform simple validation to ensure required fields exist
+            required_keys = ["Similarity_Score_Percent", "Risk_Level", "Reasoning"]
+            if not all(key in analysis_result for key in required_keys):
+                 raise ValueError(f"Missing required fields in response: {analysis_result}")
+                 
             return analysis_result, None
             
         except json.JSONDecodeError as e:
             st.error(f"❌ **JSON Parsing Failed:** The model's response could not be converted to JSON. Raw output: `{response.text}`")
             return None, f"JSONDecodeError: {e}"
+        except ValueError as e:
+            st.error(f"❌ **Data Validation Failed:** The model returned JSON, but it was incomplete. Error: {e}")
+            return None, f"DataValidationError: {e}"
         except Exception as e:
             return None, f"Gemini API Call Failed: {e}"
 
@@ -184,14 +184,12 @@ def send_email_report(analysis_data, score):
         st.warning("⚠️ **Email Setup Pending:** Skipping email. Configure email secrets to enable sending.")
         return False
         
-    # Determine the action recommendation based on the score
-    action_rec = analysis_data.get('Action_Recommendation', 'Unknown') 
+    action_rec = 'APPROVE (New Product)'
     if score >= 75:
          action_rec = 'REJECT AND INVESTIGATE (High Similarity)'
     elif score >= 26:
          action_rec = 'REVIEW NAME/PRICE (Medium Similarity)'
-    else:
-         action_rec = 'APPROVE (New Product)'
+    
 
     # Build the neat email body format
     report_body = f"""
@@ -228,7 +226,6 @@ if st.button("🔍 Run Similarity Check & Generate Report", type="primary"):
             
             # --- Score Conversion ---
             try:
-                # Convert the score (which is a string like '95') to an integer for comparison
                 score = int(analysis_data['Similarity_Score_Percent'].strip())
             except ValueError:
                 st.error("Error: AI returned a score that is not a valid number. Defaulting to 0% score.")
@@ -257,7 +254,7 @@ if st.button("🔍 Run Similarity Check & Generate Report", type="primary"):
 
             st.markdown(f"**Detailed Reasoning:** {analysis_data['Reasoning']}")
             
-            # 3. Check for the 75% threshold and send email
+            # 3. Check for the 75% threshold and send email (Simulated)
             if score >= 75:
                 st.info("🎯 **Threshold Met (>= 75%):** High similarity detected. Preparing to send email alert.")
                 send_email_report(analysis_data, score)
