@@ -88,7 +88,9 @@ def run_similarity_analysis(data_df, new_name, new_price):
     analysis_schema = types.Schema(
         type=types.Type.OBJECT,
         properties={
-            "Similarity_Score_Percent": types.Type.INTEGER,
+            # CHANGE THIS LINE: from types.Type.INTEGER to types.Type.STRING
+            "Similarity_Score_Percent": types.Type.STRING, 
+            
             "Risk_Level": types.Type.STRING,
             "Matching_Product_ID": types.Type.STRING,
             "Matching_Product_Description": types.Type.STRING,
@@ -192,36 +194,23 @@ if st.button("🔍 Run Similarity Check & Generate Report", type="primary"):
         # 1. Run the analysis
         analysis_data, error = run_similarity_analysis(sample_data, new_listing_name, new_listing_price)
         
-        # 2. Display results or error
-        if analysis_data:
-            st.markdown("---")
-            st.subheader("✅ AI Similarity Guardian Report")
-            
-            # Determine background color based on risk level
-            risk = analysis_data['Risk_Level'].lower()
-            if risk == "high risk":
-                st.error(f"### 🚨 {analysis_data['Risk_Level'].upper()} - Likely Duplicate Detected")
-            elif risk == "medium risk":
-                st.warning(f"### 🟠 {analysis_data['Risk_Level'].upper()} - Review Recommended")
-            else:
-                st.success(f"### 🟢 {analysis_data['Risk_Level'].upper()} - New Product")
-            
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Similarity Score", f"{analysis_data['Similarity_Score_Percent']}%")
-                st.metric("Matching Product ID", analysis_data.get('Matching_Product_ID', 'N/A'))
-            with col2:
-                st.metric("Matching Description", analysis_data.get('Matching_Product_Description', 'N/A'))
-                st.metric("Recommended Action", analysis_data['Action_Recommendation'])
+      # 2. Display results or error
+            if analysis_data:
+                # ... (omitting lines for brevity) ...
 
-            st.markdown(f"**Detailed Reasoning:** {analysis_data['Reasoning']}")
-            
-            # 3. Check for the 75% threshold and send email
-            if analysis_data['Similarity_Score_Percent'] >= 75:
-                st.info("🎯 **Threshold Met:** Similarity score is 75% or higher. Preparing to send email alert.")
-                send_email_report(analysis_data)
+                st.markdown(f"**Detailed Reasoning:** {analysis_data['Reasoning']}")
                 
+                # --- FIX: Convert the string score to an integer for comparison ---
+                try:
+                    score = int(analysis_data['Similarity_Score_Percent'].replace('%', '').strip())
+                except ValueError:
+                    st.error("Error parsing the score from AI output. Using default score of 0.")
+                    score = 0
+                
+       # 3. Check for the 75% threshold and send email
+                if score >= 75:
+                    st.info("🎯 **Threshold Met:** Similarity score is 75% or higher. Preparing to send email alert.")
+                    send_email_report(analysis_data)
         elif error:
             st.error(f"Analysis failed: {error}")
     else:
