@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import json
 import os
+import re # Import the regular expression module
 from google import genai
 from google.genai import types
 
@@ -15,12 +16,35 @@ SMTP_PORT = st.secrets.get("SMTP_PORT", 587)
 SENDER_EMAIL = st.secrets.get("SENDER_EMAIL", "your_sender_email@gmail.com")
 SENDER_PASSWORD = st.secrets.get("SENDER_PASSWORD", "your_app_password")
 
+# --- DATA CLEANING FUNCTION (NEW) ---
+def clean_json_response(response_text: str) -> str:
+    """
+    Cleans the raw text response from the Gemini API to extract a pure JSON string.
+    This fixes issues where the model wraps the JSON in markdown (```json ... ```) 
+    or adds extraneous text before or after the JSON object.
+    """
+    # Pattern to find a JSON block wrapped in ```json ... ``` or just ``` ... ```
+    match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response_text)
+    if match:
+        # Return the content inside the markdown block
+        return match.group(1).strip()
+    
+    # Fallback: if no markdown wrapper is found, try to find a pure JSON object
+    # This is a very simple pattern to match content between the first { and last }
+    # It might fail for complex or nested JSON but is a reasonable last resort.
+    match = re.search(r'\{[\s\S]*\}', response_text.strip())
+    if match:
+        return match.group(0).strip()
+    
+    # If all else fails, return the original text, which will likely fail parsing
+    return response_text.strip()
+
+
 # --- DATA LOADING FUNCTION ---
 @st.cache_data
 def load_sample_data():
     """Loads the sample product data from CSV."""
     if os.path.exists("sample_products.csv"):
-        # Explicitly defining data types for robustness
         try:
             df = pd.read_csv("sample_products.csv", dtype={'Product_ID': str, 'Brand': str, 'Description': str, 'Price': int})
             return df
@@ -77,7 +101,6 @@ new_listing_price = st.number_input(
 def run_similarity_analysis(data_df, new_name, new_price):
     """
     Constructs the prompt and calls the Gemini API to perform similarity analysis.
-    This version uses a highly specific schema to fix validation errors.
     """
     if not client:
         return None, "Gemini client not initialized."
@@ -85,11 +108,10 @@ def run_similarity_analysis(data_df, new_name, new_price):
     # 1. Prepare the Sample Data as a readable string for the model
     data_str = data_df.to_string(index=False)
     
-    # 2. Define the Structured Output Schema - SIMPLIFIED FOR ROBUSTNESS
+    # 2. Define the Structured Output Schema - SIMPLIFIED AND STRING-ONLY
     analysis_schema = types.Schema(
         type=types.Type.OBJECT,
         properties={
-            # Score must be a STRING to avoid pydantic validation issues
             "Similarity_Score_Percent": types.Type.STRING, 
             "Risk_Level": types.Type.STRING,
             "Matching_Product_ID": types.Type.STRING,
@@ -103,7 +125,7 @@ def run_similarity_analysis(data_df, new_name, new_price):
         "You are an AI Product Duplication and Similarity Guardian. "
         "Your task is to compare a NEW listing against a list of EXISTING products. "
         "The comparison must determine a similarity score (0-100%). "
-        "A score over 75% is 'HIGH RISK'."
+        "A score over 75% is 'HIGH RISK'. The output MUST be a JSON object ONLY."
     )
     
     prompt = f"""
@@ -123,10 +145,10 @@ def run_similarity_analysis(data_df, new_name, new_price):
        - 26-75%: Medium Risk
        - 76-100%: High Risk
     5. Provide a clear, concise 'Reasoning' based on the name and price similarity.
-    6. Return the output ONLY as a single JSON object that strictly conforms to the provided schema.
+    6. Return the output ONLY as a single JSON object that strictly conforms to the provided schema. DO NOT include any markdown formatting like ```json.
     """
     
-    # 4. Call the Gemini API with the structured response configuration
+    # 4. Call the Gemini API 
     with st.spinner("Running deep similarity analysis with Gemini..."):
         try:
             response = client.models.generate_content(
@@ -138,13 +160,19 @@ def run_similarity_analysis(data_df, new_name, new_price):
                     response_schema=analysis_schema
                 )
             )
-            # The response.text is a JSON string conforming to the schema
-            analysis_result = json.loads(response.text)
+            
+            # --- CRITICAL FIX: Clean the response text before loading JSON ---
+            cleaned_json_str = clean_json_response(response.text)
+            
+            # Try to load the cleaned JSON string
+            analysis_result = json.loads(cleaned_json_str)
             return analysis_result, None
             
+        except json.JSONDecodeError as e:
+            st.error(f"❌ **JSON Parsing Failed:** The model's response could not be converted to JSON. Raw output: `{response.text}`")
+            return None, f"JSONDecodeError: {e}"
         except Exception as e:
-            # Added more specific feedback for the validation error
-            return None, f"Gemini API Call Failed (Validation/Parsing Error): {e}\n\nThis may be caused by the model not returning a perfect JSON object."
+            return None, f"Gemini API Call Failed: {e}"
 
 
 # --- EMAIL FUNCTION (Placeholder) ---
@@ -156,6 +184,15 @@ def send_email_report(analysis_data, score):
         st.warning("⚠️ **Email Setup Pending:** Skipping email. Configure email secrets to enable sending.")
         return False
         
+    # Determine the action recommendation based on the score
+    action_rec = analysis_data.get('Action_Recommendation', 'Unknown') 
+    if score >= 75:
+         action_rec = 'REJECT AND INVESTIGATE (High Similarity)'
+    elif score >= 26:
+         action_rec = 'REVIEW NAME/PRICE (Medium Similarity)'
+    else:
+         action_rec = 'APPROVE (New Product)'
+
     # Build the neat email body format
     report_body = f"""
     **AAG Similarity Report**
@@ -169,7 +206,7 @@ def send_email_report(analysis_data, score):
     * **Similarity Score:** {score}%
     * **Matching Product ID:** {analysis_data.get('Matching_Product_ID', 'N/A')}
     * **Reasoning:** {analysis_data['Reasoning']}
-    * **Recommended Action:** {'REJECT AND INVESTIGATE' if score >= 75 else 'Review for possible price/name inconsistency.'}
+    * **Recommended Action:** {action_rec}
     """
 
     st.success(f"✅ **Report Prepared for {EMAIL_RECIPIENT}:** (Simulated Send)")
@@ -197,16 +234,16 @@ if st.button("🔍 Run Similarity Check & Generate Report", type="primary"):
                 st.error("Error: AI returned a score that is not a valid number. Defaulting to 0% score.")
                 score = 0
             
-            # Determine risk and display accordingly
+            # Determine risk and action
             risk = analysis_data['Risk_Level'].lower()
-            if risk == "high risk":
-                st.error(f"### 🚨 {analysis_data['Risk_Level'].upper()} - Likely Duplicate Detected")
+            if risk == "high risk" or score >= 76:
+                st.error(f"### 🚨 HIGH RISK - Likely Duplicate Detected")
                 action_rec = "REJECT AND INVESTIGATE"
-            elif risk == "medium risk":
-                st.warning(f"### 🟠 {analysis_data['Risk_Level'].upper()} - Review Recommended")
+            elif risk == "medium risk" or score >= 26:
+                st.warning(f"### 🟠 MEDIUM RISK - Review Recommended")
                 action_rec = "REVIEW NAME/PRICE"
             else:
-                st.success(f"### 🟢 {analysis_data['Risk_Level'].upper()} - New Product")
+                st.success(f"### 🟢 LOW RISK - New Product")
                 action_rec = "APPROVE"
             
             
@@ -215,7 +252,6 @@ if st.button("🔍 Run Similarity Check & Generate Report", type="primary"):
                 st.metric("Similarity Score", f"{score}%")
                 st.metric("Matching Product ID", analysis_data.get('Matching_Product_ID', 'N/A'))
             with col2:
-                # The simpler schema doesn't have Matching_Product_Description anymore
                 st.metric("Risk Level", analysis_data['Risk_Level'])
                 st.metric("Recommended Action", action_rec)
 
